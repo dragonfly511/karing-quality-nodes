@@ -3,13 +3,203 @@ name: Karing Quality Nodes
 
 on:
   workflow_dispatch:
-  push:
-    branches:
-      - main
+  schedule:
+    - cron: "17 */6 * * *"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: karing-quality-nodes
+  cancel-in-progress: false
 
 jobs:
-  check:
+  build:
     runs-on: ubuntu-latest
+    timeout-minutes: 350
+
     steps:
-      - name: Confirm workflow registration
-        run: echo "Karing Quality Nodes workflow is working"
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Python dependency
+        run: python -m pip install PyYAML==6.0.3
+
+      - name: Validate source subscriptions
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          from urllib.parse import urlparse
+
+          path = Path("subscriptions.txt")
+          if not path.is_file():
+              raise SystemExit("subscriptions.txt is missing")
+
+          urls = [
+              line.strip()
+              for line in path.read_text(encoding="utf-8").splitlines()
+              if line.strip() and not line.strip().startswith("#")
+          ]
+
+          if not urls:
+              raise SystemExit("No subscription URLs configured")
+
+          for url in urls:
+              parsed = urlparse(url)
+              if parsed.scheme != "https" or not parsed.netloc:
+                  raise SystemExit("Invalid HTTPS subscription URL")
+
+          print(f"Validated {len(urls)} subscription sources")
+          PY
+
+      - name: Download Mihomo
+        shell: bash
+        run: |
+          python - <<'PY'
+          import gzip
+          import json
+          import urllib.request
+          from pathlib import Path
+
+          api = "https://api.github.com/repos/MetaCubeX/mihomo/releases/latest"
+          req = urllib.request.Request(
+              api,
+              headers={
+                  "Accept": "application/vnd.github+json",
+                  "User-Agent": "GitHub-Actions"
+              }
+          )
+
+          with urllib.request.urlopen(req, timeout=30) as response:
+              release = json.load(response)
+
+          assets = [
+              item for item in release.get("assets", [])
+              if item["name"].startswith("mihomo-linux-amd64-v1")
+              and item["name"].endswith(".gz")
+          ]
+
+          if not assets:
+              raise SystemExit(
+                  "No matching Mihomo Linux AMD64 release asset found"
+              )
+
+          asset = assets[0]
+          req = urllib.request.Request(
+              asset["browser_download_url"],
+              headers={"User-Agent": "GitHub-Actions"}
+          )
+
+          with urllib.request.urlopen(req, timeout=120) as response:
+              binary = gzip.decompress(response.read())
+
+          target = Path("mihomo")
+          target.write_bytes(binary)
+          target.chmod(0o755)
+
+          print("Downloaded Mihomo:", asset["name"])
+          PY
+
+          ./mihomo -v
+
+      - name: Build speedtest tool
+        shell: bash
+        run: |
+          git clone --depth 1 \
+            https://github.com/KodeBarinn/mihomo-speedtest-rs.git \
+            /tmp/mihomo-speedtest-rs
+
+          cargo build --release --locked \
+            --manifest-path /tmp/mihomo-speedtest-rs/Cargo.toml
+
+          test -x \
+            /tmp/mihomo-speedtest-rs/target/release/mihomo-speedtest
+
+      - name: Run actual speed tests
+        shell: bash
+        run: |
+          mkdir -p output
+
+          CONFIG_URLS="$(
+            grep -v '^[[:space:]]*#' subscriptions.txt |
+            sed '/^[[:space:]]*$/d' |
+            paste -sd, -
+          )"
+
+          test -n "$CONFIG_URLS" || {
+            echo "No subscription URLs found"
+            exit 1
+          }
+
+          /tmp/mihomo-speedtest-rs/target/release/mihomo-speedtest \
+            --config "$CONFIG_URLS" \
+            --use-mihomo \
+            --mihomo-binary "$GITHUB_WORKSPACE/mihomo" \
+            --min-download-speed 3 \
+            --download-size 20 \
+            --timeout 20s \
+            --output output/passing.yaml \
+            --json \
+            > output/speedtest-results.json
+
+          test -s output/speedtest-results.json
+          test -s output/passing.yaml
+
+      - name: Select the fastest 100 nodes
+        run: python scripts/select_top.py
+
+      - name: Validate final subscription
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import yaml
+
+          path = Path("output/karing.yaml")
+          if not path.is_file():
+              raise SystemExit("Final Karing configuration is missing")
+
+          data = yaml.safe_load(path.read_text(encoding="utf-8"))
+          if not isinstance(data, dict):
+              raise SystemExit("Invalid final YAML")
+
+          proxies = data.get("proxies")
+          if not isinstance(proxies, list) or not proxies:
+              raise SystemExit("Final configuration has no proxies")
+
+          if len(proxies) > 100:
+              raise SystemExit("More than 100 nodes were exported")
+
+          print(f"Validated {len(proxies)} selected nodes")
+          PY
+
+      - name: Show summary
+        run: cat output/summary.txt
+
+      - name: Commit updated results
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email \
+            "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add output/karing.yaml \
+                  output/passing.yaml \
+                  output/speedtest-results.json \
+                  output/summary.txt
+
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+          else
+            git commit -m "Update quality Karing nodes"
+            git push
+          fi
