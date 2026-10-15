@@ -1,0 +1,15 @@
+
+name: Quality Check
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Confirm workflow works
+        run: echo "GitHub Actions workflow is working"
