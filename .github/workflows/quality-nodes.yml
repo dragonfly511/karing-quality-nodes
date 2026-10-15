@@ -168,3 +168,4 @@ jobs:
             git commit -m "Update quality Karing nodes"
             git push
           fi
+# refresh workflow registration
