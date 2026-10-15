@@ -1,0 +1,4 @@
+
+# Add one public subscription URL per line.
+# Lines beginning with # are ignored.
+# Use subscription URLs that you are authorized to access.
